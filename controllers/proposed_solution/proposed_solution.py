@@ -63,6 +63,13 @@ class SARController:
         self.sim_logs_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sim_logs")
         self.ready_marker_path = os.path.join(self.sim_logs_dir, READY_MARKER_NAME)
 
+        self.lidar = self.robot.getDevice("laser")
+        if self.lidar:
+            self.lidar.enable(self.timestep)
+            self.lidar.enablePointCloud()
+        else:
+            print(f"[{self.robot_id}] WARNING: LiDAR device 'laser' not found.")
+
     def _wait_for_map_ready(self):
         """
         robot2 blocks here (stepping the sim so it doesn't desync) until
@@ -146,6 +153,7 @@ class SARController:
         self.robot.step(self.timestep)
         self.load_and_split_targets()
 
+        # THE MAIN CONTROL LOOP (This must wrap all movement logic)
         while self.robot.step(self.timestep) != -1:
             self.update_odometry()
 
@@ -180,8 +188,35 @@ class SARController:
             turn_speed = max(-MAX_SPEED, min(MAX_SPEED, angle_error * 3.0))
             forward_speed = MAX_SPEED if abs(angle_error) < 0.5 else 0.0
 
-            self.set_speed(forward_speed - turn_speed, forward_speed + turn_speed)
+            # --- LiDAR Reactive Avoidance ---
+            avoidance_turn = 0.0
+            if self.lidar:
+                range_image = self.lidar.getRangeImage()
+                if range_image:
+                    # The RpLidarA2 returns an array. We want the forward-facing cone.
+                    mid_idx = len(range_image) // 2
+                    cone_size = int(len(range_image) * 0.1) # Check a 20% slice ahead
+                    
+                    front_left = range_image[mid_idx - cone_size : mid_idx]
+                    front_right = range_image[mid_idx : mid_idx + cone_size]
+                    
+                    # Filter out 'inf' or 'nan' values safely
+                    min_left = min([r for r in front_left if not math.isinf(r) and not math.isnan(r)] + [float('inf')])
+                    min_right = min([r for r in front_right if not math.isinf(r) and not math.isnan(r)] + [float('inf')])
+                    min_front = min(min_left, min_right)
+                    
+                    # If an object breaches the 0.5m threshold, hijack the steering
+                    if min_front < 0.5:
+                        forward_speed = MAX_SPEED * 0.4 # Slow down to avoid crashing
+                        # Steer away from whichever side is closer to the wall
+                        if min_left < min_right:
+                            avoidance_turn = MAX_SPEED # Hard right
+                        else:
+                            avoidance_turn = -MAX_SPEED # Hard left
 
+            # Apply final motor commands (Avoidance overrides waypoint steering if triggered)
+            final_turn = avoidance_turn if avoidance_turn != 0.0 else turn_speed
+            self.set_speed(forward_speed - final_turn, forward_speed + final_turn)
 
 if __name__ == "__main__":
     controller = SARController()
