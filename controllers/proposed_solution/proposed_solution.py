@@ -143,7 +143,7 @@ class SARController:
         # signals readiness so robot2 doesn't read a half-written CSV.
         if self.robot_id == "robot1":
             os.makedirs(self.sim_logs_dir, exist_ok=True)
-            generate_offline_artifacts()
+            #generate_offline_artifacts()
             with open(self.ready_marker_path, "w") as f:
                 f.write("ready")
         else:
