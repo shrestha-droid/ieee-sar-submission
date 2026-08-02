@@ -21,7 +21,8 @@ random.seed(robot_id)
 steering_engine = PIDSteeringController(kp=3.0, max_speed=6.0)
 
 # --- System Constants ---
-WAYPOINT_TOLERANCE = 0.20  
+WAYPOINT_TOLERANCE = 0.20    # Stop distance for final target
+LOOKAHEAD_DISTANCE = 0.45    # NEW: Distance to start cutting the corner early
 REROUTE_COOLDOWN = 3.0     
 STALL_VELOCITY_THRESHOLD = 0.005 
 
@@ -100,11 +101,9 @@ except:
 ARENA_SIZE = 10.0 
 GRID_SIZE = 60
 
-# Downsample and threshold
 small_map = cv2.resize(raw_map, (GRID_SIZE, GRID_SIZE))
 _, binary_map = cv2.threshold(small_map, 127, 255, cv2.THRESH_BINARY)
 
-# Distance Transform Costmap
 dist_transform = cv2.distanceTransform(binary_map, cv2.DIST_L2, 5)
 max_dist = np.max(dist_transform)
 if max_dist > 0:
@@ -112,10 +111,7 @@ if max_dist > 0:
 else:
     cost_map = np.zeros_like(small_map, dtype=np.float32)
 
-# Tuned safe collision mask
 obstacle_mask = dist_transform < 2.0 
-
-# Coverage Tracker
 visited_grid = np.zeros((GRID_SIZE, GRID_SIZE), dtype=bool)
 
 current_x = -0.375
@@ -147,7 +143,6 @@ def update_odometry():
     current_x += dist_center * math.cos(current_heading)
     current_y += dist_center * math.sin(current_heading)
     
-    # Mark current area as visited
     gx, gy = world_to_grid(current_x, current_y)
     for dy in range(-2, 3):
         for dx in range(-2, 3):
@@ -183,6 +178,28 @@ def grid_to_world(gx, gy):
     wy = offset - (gy / float(GRID_SIZE)) * ARENA_SIZE
     return (wx, wy)
 
+# NEW: Bresenham's Line Algorithm to check if a path between two nodes is clear
+def has_line_of_sight(g1, g2):
+    x0, y0 = g1
+    x1, y1 = g2
+    dx = abs(x1 - x0)
+    dy = abs(y1 - y0)
+    x_step = 1 if x0 < x1 else -1
+    y_step = 1 if y0 < y1 else -1
+    error = dx - dy
+
+    while x0 != x1 or y0 != y1:
+        if not (0 <= x0 < GRID_SIZE and 0 <= y0 < GRID_SIZE) or obstacle_mask[y0, x0]:
+            return False
+        e2 = 2 * error
+        if e2 > -dy:
+            error -= dy
+            x0 += x_step
+        if e2 < dx:
+            error += dx
+            y0 += y_step
+    return True
+
 def a_star_pathfind(start_world, target_world):
     start = world_to_grid(start_world[0], start_world[1])
     goal = world_to_grid(target_world[0], target_world[1])
@@ -208,7 +225,6 @@ def a_star_pathfind(start_world, target_world):
             if 0 <= nx < GRID_SIZE and 0 <= ny < GRID_SIZE:
                 if obstacle_mask[ny, nx]: continue
                 
-                # Tuned down gradient penalty to prevent A* from failing in doorways
                 wall_penalty = cost_map[ny, nx] * 3.0 
                 tentative_g = g_score[current] + math.hypot(dx, dy) + wall_penalty
                 
@@ -222,8 +238,19 @@ def a_star_pathfind(start_world, target_world):
     if not path_grid:
         return [target_world]
         
-    # Reverted path smoothing to raw grid nodes to stop corner cutting
-    return [grid_to_world(x, y) for (x, y) in path_grid]
+    # NEW: Theta* Line-of-Sight Pruning (Removes zigzag staircase waypoints)
+    smoothed_grid = [path_grid[0]]
+    curr_idx = 0
+    while curr_idx < len(path_grid) - 1:
+        furthest = curr_idx + 1
+        for i in range(len(path_grid) - 1, curr_idx, -1):
+            if has_line_of_sight(path_grid[curr_idx], path_grid[i]):
+                furthest = i
+                break
+        smoothed_grid.append(path_grid[furthest])
+        curr_idx = furthest
+        
+    return [grid_to_world(x, y) for (x, y) in smoothed_grid]
 
 def generate_coverage_waypoints(num_points=6):
     global visited_grid
@@ -233,12 +260,10 @@ def generate_coverage_waypoints(num_points=6):
     for i in range(len(safe_x)):
         gx, gy = safe_x[i], safe_y[i]
         
-        # Ignore if already visited
         if visited_grid[gy, gx]: continue
             
         wx, wy = grid_to_world(gx, gy)
         
-        # Sector Splitting
         if "1" in robot_id and wx < 0: continue
         if "2" in robot_id and wx >= 0: continue
             
@@ -259,7 +284,7 @@ def stop_motors():
 # =========================================================================
 # 5. STATE MACHINE EXECUTION LOOP
 # =========================================================================
-print(f"[{robot_id}] Stabilized Navigation Engine Online.")
+print(f"[{robot_id}] Theta* Navigation Engine Online with Corner Cutting.")
 search_waypoints = generate_coverage_waypoints(num_points=4)
 current_target = None
 current_path = []
@@ -287,15 +312,24 @@ while rosbot.step(timestep) != -1:
         if not search_waypoints:
             search_waypoints = generate_coverage_waypoints(num_points=4)
         
-        current_target = search_waypoints.pop(0)
-        current_path = a_star_pathfind((current_x, current_y), current_target)
+        final_target = search_waypoints.pop(0)
+        current_path = a_star_pathfind((current_x, current_y), final_target)
         
         if current_path:
+            # We pop the first coordinate because it's where the robot currently is
+            current_target = current_path.pop(0) 
             current_state = RobotState.NAVIGATING
             last_reroute_time = rosbot.getTime()
             
     elif current_state == RobotState.NAVIGATING:
-        if math.hypot(current_target[0] - current_x, current_target[1] - current_y) < WAYPOINT_TOLERANCE:
+        dist_to_wp = math.hypot(current_target[0] - current_x, current_target[1] - current_y)
+        
+        # NEW: Dynamic Corner Cutting (Lookahead Logic)
+        if dist_to_wp < LOOKAHEAD_DISTANCE and len(current_path) > 0:
+            # If we are close enough, switch our steering target to the next node early!
+            current_target = current_path.pop(0)
+        elif dist_to_wp < WAYPOINT_TOLERANCE and len(current_path) == 0:
+            # Final destination reached
             current_state = RobotState.EXPLORING
             continue
 
@@ -312,8 +346,9 @@ while rosbot.step(timestep) != -1:
             stuck_counter = 0
             continue
 
-        # Removed the buggy LiDAR swerve to let the PID controller handle the raw A* path
-        left_speed, right_speed = steering_engine.calculate_speeds(current_x, current_y, current_heading, current_path)
+        # Temporarily rebuild the path list so the PID engine accepts it
+        pid_path = [current_target] + current_path
+        left_speed, right_speed = steering_engine.calculate_speeds(current_x, current_y, current_heading, pid_path)
 
         motors["fl"].setVelocity(left_speed)
         motors["rl"].setVelocity(left_speed)
