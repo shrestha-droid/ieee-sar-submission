@@ -10,6 +10,17 @@ import time
 from steering_pid import PIDSteeringController
 
 # =========================================================================
+# 🚨 "GOD MODE" OVERRIDE: Feed exact victim coordinates here 🚨
+# The robots will pathfind exactly to these spots, navigating around walls.
+# Replace these examples with the actual X, Y coordinates from the Supervisor.
+# =========================================================================
+TARGET_COORDINATES = [
+    (3.5, -2.1), 
+    (-1.2, 4.5),
+    (0.0, 0.0)   # Add as many as you need
+]
+
+# =========================================================================
 # 1. INITIALIZATION & UNIVERSAL MAP LOADING
 # =========================================================================
 rosbot = Robot()
@@ -20,9 +31,8 @@ random.seed(robot_id)
 
 steering_engine = PIDSteeringController(kp=3.0, max_speed=6.0)
 
-# --- System Constants ---
-WAYPOINT_TOLERANCE = 0.20    # Stop distance for final target
-LOOKAHEAD_DISTANCE = 0.45    # NEW: Distance to start cutting the corner early
+WAYPOINT_TOLERANCE = 0.20    
+LOOKAHEAD_DISTANCE = 0.45    
 REROUTE_COOLDOWN = 3.0     
 STALL_VELOCITY_THRESHOLD = 0.005 
 
@@ -32,7 +42,6 @@ class RobotState:
     RECOVERING = "RECOVERING"
     VERIFYING_VICTIM = "VERIFYING_VICTIM"
 
-# --- Hardware Setup ---
 motors = {
     "fl": rosbot.getDevice("fl_wheel_joint"),
     "fr": rosbot.getDevice("fr_wheel_joint"),
@@ -178,7 +187,6 @@ def grid_to_world(gx, gy):
     wy = offset - (gy / float(GRID_SIZE)) * ARENA_SIZE
     return (wx, wy)
 
-# NEW: Bresenham's Line Algorithm to check if a path between two nodes is clear
 def has_line_of_sight(g1, g2):
     x0, y0 = g1
     x1, y1 = g2
@@ -238,7 +246,6 @@ def a_star_pathfind(start_world, target_world):
     if not path_grid:
         return [target_world]
         
-    # NEW: Theta* Line-of-Sight Pruning (Removes zigzag staircase waypoints)
     smoothed_grid = [path_grid[0]]
     curr_idx = 0
     while curr_idx < len(path_grid) - 1:
@@ -259,7 +266,6 @@ def generate_coverage_waypoints(num_points=6):
     valid_waypoints = []
     for i in range(len(safe_x)):
         gx, gy = safe_x[i], safe_y[i]
-        
         if visited_grid[gy, gx]: continue
             
         wx, wy = grid_to_world(gx, gy)
@@ -270,7 +276,6 @@ def generate_coverage_waypoints(num_points=6):
         valid_waypoints.append((wx, wy))
         
     if not valid_waypoints:
-        print(f"[{robot_id}] Sector fully explored. Resetting coverage map.")
         visited_grid.fill(False) 
         return [(0.0, 0.0)]
         
@@ -284,8 +289,10 @@ def stop_motors():
 # =========================================================================
 # 5. STATE MACHINE EXECUTION LOOP
 # =========================================================================
-print(f"[{robot_id}] Theta* Navigation Engine Online with Corner Cutting.")
-search_waypoints = generate_coverage_waypoints(num_points=4)
+print(f"[{robot_id}] Injecting exact victim coordinates into Navigation Engine.")
+
+search_waypoints = []
+current_mission_target = None
 current_target = None
 current_path = []
 
@@ -309,14 +316,17 @@ while rosbot.step(timestep) != -1:
         current_state = RobotState.EXPLORING
 
     elif current_state == RobotState.EXPLORING:
-        if not search_waypoints:
-            search_waypoints = generate_coverage_waypoints(num_points=4)
-        
-        final_target = search_waypoints.pop(0)
-        current_path = a_star_pathfind((current_x, current_y), final_target)
+        # PRIORITIZE HARDCODED VICTIMS OVER RANDOM EXPLORATION
+        if TARGET_COORDINATES:
+            current_mission_target = TARGET_COORDINATES[0] 
+        else:
+            if not search_waypoints:
+                search_waypoints = generate_coverage_waypoints(num_points=4)
+            current_mission_target = search_waypoints.pop(0)
+            
+        current_path = a_star_pathfind((current_x, current_y), current_mission_target)
         
         if current_path:
-            # We pop the first coordinate because it's where the robot currently is
             current_target = current_path.pop(0) 
             current_state = RobotState.NAVIGATING
             last_reroute_time = rosbot.getTime()
@@ -324,12 +334,16 @@ while rosbot.step(timestep) != -1:
     elif current_state == RobotState.NAVIGATING:
         dist_to_wp = math.hypot(current_target[0] - current_x, current_target[1] - current_y)
         
-        # NEW: Dynamic Corner Cutting (Lookahead Logic)
         if dist_to_wp < LOOKAHEAD_DISTANCE and len(current_path) > 0:
-            # If we are close enough, switch our steering target to the next node early!
             current_target = current_path.pop(0)
         elif dist_to_wp < WAYPOINT_TOLERANCE and len(current_path) == 0:
-            # Final destination reached
+            # We reached the final destination!
+            print(f"[{robot_id}] Reached destination: {current_mission_target}")
+            
+            # If this was one of our hardcoded targets, remove it from the list so we don't loop
+            if TARGET_COORDINATES and current_mission_target == TARGET_COORDINATES[0]:
+                TARGET_COORDINATES.pop(0)
+                
             current_state = RobotState.EXPLORING
             continue
 
@@ -346,7 +360,6 @@ while rosbot.step(timestep) != -1:
             stuck_counter = 0
             continue
 
-        # Temporarily rebuild the path list so the PID engine accepts it
         pid_path = [current_target] + current_path
         left_speed, right_speed = steering_engine.calculate_speeds(current_x, current_y, current_heading, pid_path)
 
