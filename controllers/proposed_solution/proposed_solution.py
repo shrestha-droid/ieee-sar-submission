@@ -104,19 +104,18 @@ GRID_SIZE = 60
 small_map = cv2.resize(raw_map, (GRID_SIZE, GRID_SIZE))
 _, binary_map = cv2.threshold(small_map, 127, 255, cv2.THRESH_BINARY)
 
-# 🚀 UPGRADE: Distance Transform Costmap
+# Distance Transform Costmap
 dist_transform = cv2.distanceTransform(binary_map, cv2.DIST_L2, 5)
 max_dist = np.max(dist_transform)
 if max_dist > 0:
-    # 0.0 is safe center, 1.0 is danger wall
     cost_map = 1.0 - (dist_transform / max_dist)
 else:
     cost_map = np.zeros_like(small_map, dtype=np.float32)
 
-# Absolute collision boundary (Pixels < 2 are walls)
+# Tuned safe collision mask
 obstacle_mask = dist_transform < 2.0 
 
-# 🚀 UPGRADE: Coverage Tracker (Frontier Lite)
+# Coverage Tracker
 visited_grid = np.zeros((GRID_SIZE, GRID_SIZE), dtype=bool)
 
 current_x = -0.375
@@ -209,8 +208,8 @@ def a_star_pathfind(start_world, target_world):
             if 0 <= nx < GRID_SIZE and 0 <= ny < GRID_SIZE:
                 if obstacle_mask[ny, nx]: continue
                 
-                # 🚀 UPGRADE: Gradient Penalty (Force center of halls)
-                wall_penalty = cost_map[ny, nx] * 15.0 
+                # Tuned down gradient penalty to prevent A* from failing in doorways
+                wall_penalty = cost_map[ny, nx] * 3.0 
                 tentative_g = g_score[current] + math.hypot(dx, dy) + wall_penalty
                 
                 neighbor = (nx, ny)
@@ -222,18 +221,9 @@ def a_star_pathfind(start_world, target_world):
 
     if not path_grid:
         return [target_world]
-
-    # 🚀 UPGRADE: Path Smoothing (Moving Average)
-    smoothed_path = []
-    if len(path_grid) > 2:
-        for i in range(1, len(path_grid) - 1):
-            sx = (path_grid[i-1][0] + path_grid[i][0] + path_grid[i+1][0]) / 3.0
-            sy = (path_grid[i-1][1] + path_grid[i][1] + path_grid[i+1][1]) / 3.0
-            smoothed_path.append(grid_to_world(sx, sy))
-    else:
-        smoothed_path = [grid_to_world(x, y) for (x, y) in path_grid]
         
-    return smoothed_path
+    # Reverted path smoothing to raw grid nodes to stop corner cutting
+    return [grid_to_world(x, y) for (x, y) in path_grid]
 
 def generate_coverage_waypoints(num_points=6):
     global visited_grid
@@ -243,7 +233,7 @@ def generate_coverage_waypoints(num_points=6):
     for i in range(len(safe_x)):
         gx, gy = safe_x[i], safe_y[i]
         
-        # 🚀 UPGRADE: Ignore if already visited
+        # Ignore if already visited
         if visited_grid[gy, gx]: continue
             
         wx, wy = grid_to_world(gx, gy)
@@ -256,7 +246,7 @@ def generate_coverage_waypoints(num_points=6):
         
     if not valid_waypoints:
         print(f"[{robot_id}] Sector fully explored. Resetting coverage map.")
-        visited_grid.fill(False) # Reset when map is fully mowed
+        visited_grid.fill(False) 
         return [(0.0, 0.0)]
         
     random.shuffle(valid_waypoints)
@@ -269,7 +259,7 @@ def stop_motors():
 # =========================================================================
 # 5. STATE MACHINE EXECUTION LOOP
 # =========================================================================
-print(f"[{robot_id}] Advanced Navigation Engine Online.")
+print(f"[{robot_id}] Stabilized Navigation Engine Online.")
 search_waypoints = generate_coverage_waypoints(num_points=4)
 current_target = None
 current_path = []
@@ -322,22 +312,8 @@ while rosbot.step(timestep) != -1:
             stuck_counter = 0
             continue
 
+        # Removed the buggy LiDAR swerve to let the PID controller handle the raw A* path
         left_speed, right_speed = steering_engine.calculate_speeds(current_x, current_y, current_heading, current_path)
-        
-        # 🚀 UPGRADE: Proactive Reactive Dodging
-        depth_data = lidar.getRangeImage()
-        if depth_data:
-            rays = len(depth_data)
-            left_scan = min(depth_data[int(rays*0.1):int(rays*0.4)])
-            front_scan = min(depth_data[int(rays*0.4):int(rays*0.6)])
-            right_scan = min(depth_data[int(rays*0.6):int(rays*0.9)])
-            
-            # Swerve if an obstacle suddenly appears in front
-            if front_scan < 0.4:
-                if left_scan > right_scan:
-                    left_speed -= 2.0; right_speed += 2.0 # Swerve Left
-                else:
-                    left_speed += 2.0; right_speed -= 2.0 # Swerve Right
 
         motors["fl"].setVelocity(left_speed)
         motors["rl"].setVelocity(left_speed)
