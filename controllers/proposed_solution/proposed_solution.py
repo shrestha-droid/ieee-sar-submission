@@ -18,10 +18,9 @@ robot_id = rosbot.getName()
 
 random.seed(robot_id)
 
-# Initialize steering engine
 steering_engine = PIDSteeringController(kp=3.0, max_speed=6.0)
 
-# --- System Constants for Efficiency ---
+# --- System Constants ---
 WAYPOINT_TOLERANCE = 0.20  
 REROUTE_COOLDOWN = 3.0     
 STALL_VELOCITY_THRESHOLD = 0.005 
@@ -32,7 +31,7 @@ class RobotState:
     RECOVERING = "RECOVERING"
     VERIFYING_VICTIM = "VERIFYING_VICTIM"
 
-# --- Motors ---
+# --- Hardware Setup ---
 motors = {
     "fl": rosbot.getDevice("fl_wheel_joint"),
     "fr": rosbot.getDevice("fr_wheel_joint"),
@@ -43,7 +42,6 @@ for motor in motors.values():
     motor.setPosition(float('inf'))
     motor.setVelocity(0.0)
 
-# --- Sensors ---
 lidar = rosbot.getDevice("laser")
 lidar.enable(timestep)
 lidar.enablePointCloud()
@@ -63,9 +61,6 @@ encoders = {
 for encoder in encoders.values():
     encoder.enable(timestep)
 
-# =========================================================================
-# 2. COMMUNICATIONS & LOGGING
-# =========================================================================
 supervisor_emitter = rosbot.getDevice("supervisor emitter")
 supervisor_emitter.setChannel(43)
 
@@ -93,20 +88,36 @@ def report_victim(estimated_x, estimated_y, confidence=0.95):
         f.write(f"{rosbot.getTime()},{robot_id},{estimated_x},{estimated_y},{confidence}\n")
 
 # =========================================================================
-# 3. UNIVERSAL MAP & AUTO-SCALING ENGINE
+# 3. ADVANCED COSTMAP & GRADIENT GENERATION
 # =========================================================================
 try:
-    global_map = cv2.imread('sim_logs/map_estimate.png', cv2.IMREAD_GRAYSCALE)
-    if global_map is None: 
-        raise FileNotFoundError
-    print(f"[{robot_id}] Universal map loaded successfully.")
+    raw_map = cv2.imread('sim_logs/map_estimate.png', cv2.IMREAD_GRAYSCALE)
+    if raw_map is None: raise FileNotFoundError
 except:
-    print(f"[{robot_id}] WARNING: Map missing. Generating universal backup grid.")
-    global_map = np.ones((600, 600), dtype=np.uint8) * 255
-    cv2.rectangle(global_map, (30, 30), (570, 570), 0, 15)
+    raw_map = np.ones((600, 600), dtype=np.uint8) * 255
+    cv2.rectangle(raw_map, (30, 30), (570, 570), 0, 15)
 
 ARENA_SIZE = 10.0 
 GRID_SIZE = 60
+
+# Downsample and threshold
+small_map = cv2.resize(raw_map, (GRID_SIZE, GRID_SIZE))
+_, binary_map = cv2.threshold(small_map, 127, 255, cv2.THRESH_BINARY)
+
+# 🚀 UPGRADE: Distance Transform Costmap
+dist_transform = cv2.distanceTransform(binary_map, cv2.DIST_L2, 5)
+max_dist = np.max(dist_transform)
+if max_dist > 0:
+    # 0.0 is safe center, 1.0 is danger wall
+    cost_map = 1.0 - (dist_transform / max_dist)
+else:
+    cost_map = np.zeros_like(small_map, dtype=np.float32)
+
+# Absolute collision boundary (Pixels < 2 are walls)
+obstacle_mask = dist_transform < 2.0 
+
+# 🚀 UPGRADE: Coverage Tracker (Frontier Lite)
+visited_grid = np.zeros((GRID_SIZE, GRID_SIZE), dtype=bool)
 
 current_x = -0.375
 current_y = 0.375 if robot_id == "robot1" else 0.0
@@ -119,7 +130,7 @@ WHEEL_RADIUS = 0.0425
 # =========================================================================
 
 def update_odometry():
-    global current_x, current_y, current_heading, last_encoder_values
+    global current_x, current_y, current_heading, last_encoder_values, visited_grid
     
     fl_val = encoders["fl"].getValue()
     fr_val = encoders["fr"].getValue()
@@ -131,35 +142,32 @@ def update_odometry():
     last_encoder_values["fr"] = fr_val
     
     dist_center = (dist_left + dist_right) / 2.0
-    
     compass_vals = compass.getValues()
-    current_heading = math.atan2(compass_vals[0], compass_vals[1])
+    current_heading = math.atan2(compass_vals[1], compass_vals[0])
     
     current_x += dist_center * math.cos(current_heading)
     current_y += dist_center * math.sin(current_heading)
+    
+    # Mark current area as visited
+    gx, gy = world_to_grid(current_x, current_y)
+    for dy in range(-2, 3):
+        for dx in range(-2, 3):
+            if 0 <= gx+dx < GRID_SIZE and 0 <= gy+dy < GRID_SIZE:
+                visited_grid[gy+dy, gx+dx] = True
 
 def detect_candidate():
     raw_img = camera.getImage()
-    if not raw_img: 
-        return False
-    
+    if not raw_img: return False
     img_array = np.frombuffer(raw_img, np.uint8).reshape((camera.getHeight(), camera.getWidth(), 4))
     hsv_frame = cv2.cvtColor(img_array[:, :, :3], cv2.COLOR_BGR2HSV)
-    
-    lower_color = np.array([5, 120, 120])
-    upper_color = np.array([25, 255, 255])
-    
-    mask = cv2.inRange(hsv_frame, lower_color, upper_color)
+    mask = cv2.inRange(hsv_frame, np.array([5, 120, 120]), np.array([25, 255, 255]))
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    
     for contour in contours:
-        if cv2.contourArea(contour) > 1200:
-            return True
+        if cv2.contourArea(contour) > 1200: return True
     return False
 
 def verify_depth():
     depth_data = lidar.getRangeImage()
-    # Check center ray distance
     if depth_data and depth_data[len(depth_data) // 2] < 1.0:
         return True
     return False
@@ -177,12 +185,6 @@ def grid_to_world(gx, gy):
     return (wx, wy)
 
 def a_star_pathfind(start_world, target_world):
-    small_map = cv2.resize(global_map, (GRID_SIZE, GRID_SIZE))
-    # FIX: Reduced erosion kernel from 3x3 to 2x2 to prevent doorway blocking
-    kernel = np.ones((2, 2), np.uint8)
-    inflated_map = cv2.erode(small_map, kernel)
-    obstacle_grid = inflated_map < 127
-    
     start = world_to_grid(start_world[0], start_world[1])
     goal = world_to_grid(target_world[0], target_world[1])
     
@@ -192,22 +194,25 @@ def a_star_pathfind(start_world, target_world):
     g_score = {start: 0}
     neighbors = [(0, 1), (1, 0), (0, -1), (-1, 0), (1, 1), (-1, 1), (1, -1), (-1, -1)]
 
+    path_grid = []
     while open_set:
         _, current = heapq.heappop(open_set)
         if current == goal:
-            path = []
             while current in came_from:
-                path.append(grid_to_world(current[0], current[1]))
+                path_grid.append(current)
                 current = came_from[current]
-            path.reverse()
-            return path
+            path_grid.reverse()
+            break
 
         for dx, dy in neighbors:
             nx, ny = current[0] + dx, current[1] + dy
             if 0 <= nx < GRID_SIZE and 0 <= ny < GRID_SIZE:
-                if obstacle_grid[ny, nx]: continue
+                if obstacle_mask[ny, nx]: continue
                 
-                tentative_g = g_score[current] + math.hypot(dx, dy)
+                # 🚀 UPGRADE: Gradient Penalty (Force center of halls)
+                wall_penalty = cost_map[ny, nx] * 15.0 
+                tentative_g = g_score[current] + math.hypot(dx, dy) + wall_penalty
+                
                 neighbor = (nx, ny)
                 if neighbor not in g_score or tentative_g < g_score[neighbor]:
                     came_from[neighbor] = current
@@ -215,24 +220,47 @@ def a_star_pathfind(start_world, target_world):
                     h = math.hypot(goal[0] - nx, goal[1] - ny)
                     heapq.heappush(open_set, (tentative_g + h, neighbor))
 
-    return [target_world]
+    if not path_grid:
+        return [target_world]
 
-def generate_safe_waypoints(map_array, num_points=6):
-    small_map = cv2.resize(map_array, (GRID_SIZE, GRID_SIZE))
-    # FIX: Reduced generation erosion kernel from 5x5 to 3x3 to allow valid doorway points
-    kernel = np.ones((3, 3), np.uint8) 
-    inflated_map = cv2.erode(small_map, kernel)
-    safe_y, safe_x = np.where(inflated_map > 127)
-    
-    waypoints = []
-    if len(safe_x) > 0:
-        indices = list(range(len(safe_x)))
-        random.shuffle(indices)
-        for idx in indices[:num_points]:
-            waypoints.append(grid_to_world(safe_x[idx], safe_y[idx]))
+    # 🚀 UPGRADE: Path Smoothing (Moving Average)
+    smoothed_path = []
+    if len(path_grid) > 2:
+        for i in range(1, len(path_grid) - 1):
+            sx = (path_grid[i-1][0] + path_grid[i][0] + path_grid[i+1][0]) / 3.0
+            sy = (path_grid[i-1][1] + path_grid[i][1] + path_grid[i+1][1]) / 3.0
+            smoothed_path.append(grid_to_world(sx, sy))
     else:
-        waypoints = [(0.0, 0.0)]
-    return waypoints
+        smoothed_path = [grid_to_world(x, y) for (x, y) in path_grid]
+        
+    return smoothed_path
+
+def generate_coverage_waypoints(num_points=6):
+    global visited_grid
+    safe_y, safe_x = np.where(~obstacle_mask)
+    
+    valid_waypoints = []
+    for i in range(len(safe_x)):
+        gx, gy = safe_x[i], safe_y[i]
+        
+        # 🚀 UPGRADE: Ignore if already visited
+        if visited_grid[gy, gx]: continue
+            
+        wx, wy = grid_to_world(gx, gy)
+        
+        # Sector Splitting
+        if "1" in robot_id and wx < 0: continue
+        if "2" in robot_id and wx >= 0: continue
+            
+        valid_waypoints.append((wx, wy))
+        
+    if not valid_waypoints:
+        print(f"[{robot_id}] Sector fully explored. Resetting coverage map.")
+        visited_grid.fill(False) # Reset when map is fully mowed
+        return [(0.0, 0.0)]
+        
+    random.shuffle(valid_waypoints)
+    return valid_waypoints[:num_points]
 
 def stop_motors():
     for motor in motors.values():
@@ -241,8 +269,8 @@ def stop_motors():
 # =========================================================================
 # 5. STATE MACHINE EXECUTION LOOP
 # =========================================================================
-print(f"[{robot_id}] High-Efficiency Engine Engaged.")
-search_waypoints = generate_safe_waypoints(global_map, num_points=8)
+print(f"[{robot_id}] Advanced Navigation Engine Online.")
+search_waypoints = generate_coverage_waypoints(num_points=4)
 current_target = None
 current_path = []
 
@@ -254,28 +282,20 @@ last_reroute_time = rosbot.getTime()
 while rosbot.step(timestep) != -1:
     update_odometry()
     
-    # ---------------------------------------------------------
-    # LAYER 1: UNINTERRUPTIBLE PERCEPTION (Always check for victims)
-    # ---------------------------------------------------------
     if current_state != RobotState.VERIFYING_VICTIM and detect_candidate():
         print(f"[{robot_id}] Visual candidate spotted. Verifying depth...")
         current_state = RobotState.VERIFYING_VICTIM
 
-    # ---------------------------------------------------------
-    # LAYER 2: FINITE STATE MACHINE LOGIC
-    # ---------------------------------------------------------
     if current_state == RobotState.VERIFYING_VICTIM:
         stop_motors()
         if verify_depth():
             report_victim(current_x, current_y)
-            # Optional: Add a brief sleep/step here if you want it to pause for realism
             rosbot.step(1000) 
-        # Resume exploration whether verified or false positive
         current_state = RobotState.EXPLORING
 
     elif current_state == RobotState.EXPLORING:
         if not search_waypoints:
-            search_waypoints = generate_safe_waypoints(global_map, num_points=4)
+            search_waypoints = generate_coverage_waypoints(num_points=4)
         
         current_target = search_waypoints.pop(0)
         current_path = a_star_pathfind((current_x, current_y), current_target)
@@ -283,16 +303,12 @@ while rosbot.step(timestep) != -1:
         if current_path:
             current_state = RobotState.NAVIGATING
             last_reroute_time = rosbot.getTime()
-            print(f"[{robot_id}] Navigating to next target.")
             
     elif current_state == RobotState.NAVIGATING:
-        # Check waypoint arrival
         if math.hypot(current_target[0] - current_x, current_target[1] - current_y) < WAYPOINT_TOLERANCE:
-            print(f"[{robot_id}] Waypoint reached.")
             current_state = RobotState.EXPLORING
             continue
 
-        # Check for stalls
         distance_moved = math.hypot(current_x - last_x, current_y - last_y)
         if distance_moved < STALL_VELOCITY_THRESHOLD:
             stuck_counter += 1
@@ -301,16 +317,28 @@ while rosbot.step(timestep) != -1:
 
         last_x, last_y = current_x, current_y
 
-        # Stall trigger with Cooldown Protection
         if stuck_counter > 40 and (rosbot.getTime() - last_reroute_time > REROUTE_COOLDOWN):
             current_state = RobotState.RECOVERING
             stuck_counter = 0
             continue
 
-        # Execute normal driving
-        left_speed, right_speed = steering_engine.calculate_speeds(
-            current_x, current_y, current_heading, current_path
-        )
+        left_speed, right_speed = steering_engine.calculate_speeds(current_x, current_y, current_heading, current_path)
+        
+        # 🚀 UPGRADE: Proactive Reactive Dodging
+        depth_data = lidar.getRangeImage()
+        if depth_data:
+            rays = len(depth_data)
+            left_scan = min(depth_data[int(rays*0.1):int(rays*0.4)])
+            front_scan = min(depth_data[int(rays*0.4):int(rays*0.6)])
+            right_scan = min(depth_data[int(rays*0.6):int(rays*0.9)])
+            
+            # Swerve if an obstacle suddenly appears in front
+            if front_scan < 0.4:
+                if left_scan > right_scan:
+                    left_speed -= 2.0; right_speed += 2.0 # Swerve Left
+                else:
+                    left_speed += 2.0; right_speed -= 2.0 # Swerve Right
+
         motors["fl"].setVelocity(left_speed)
         motors["rl"].setVelocity(left_speed)
         motors["fr"].setVelocity(right_speed)
@@ -318,12 +346,9 @@ while rosbot.step(timestep) != -1:
 
     elif current_state == RobotState.RECOVERING:
         print(f"[{robot_id}] STALLED. Executing recovery maneuver.")
-        
-        # 1. Back up straight
         for motor in motors.values(): motor.setVelocity(-4.0)
         rosbot.step(600)
         
-        # 2. Spin aggressively away from the obstacle
         motors["fl"].setVelocity(-5.0)
         motors["rl"].setVelocity(-5.0)
         motors["fr"].setVelocity(5.0)
@@ -331,6 +356,4 @@ while rosbot.step(timestep) != -1:
         rosbot.step(800)
         
         stop_motors()
-        
-        # Immediately re-plan after clearing the trap
         current_state = RobotState.EXPLORING
