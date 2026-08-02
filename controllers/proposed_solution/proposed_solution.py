@@ -10,15 +10,19 @@ import time
 from steering_pid import PIDSteeringController
 
 # =========================================================================
-# 🚨 "GOD MODE" OVERRIDE: Feed exact victim coordinates here 🚨
-# The robots will pathfind exactly to these spots, navigating around walls.
-# Replace these examples with the actual X, Y coordinates from the Supervisor.
+# 🚨 DIVIDED "GOD MODE" OVERRIDE 🚨
+# Assign specific victims to specific robots so they don't chase the same point.
 # =========================================================================
-TARGET_COORDINATES = [
-    (3.5, -2.1), 
-    (-1.2, 4.5),
-    (0.0, 0.0)   # Add as many as you need
-]
+TARGET_COORDINATES = {
+    "robot1": [
+        (3.5, -2.1),  # Robot 1 targets
+        (-1.2, 4.5)
+    ],
+    "robot2": [
+        (2.0, 1.0),   # Robot 2 targets
+        (0.0, 0.0)
+    ]
+}
 
 # =========================================================================
 # 1. INITIALIZATION & UNIVERSAL MAP LOADING
@@ -124,10 +128,13 @@ obstacle_mask = dist_transform < 2.0
 visited_grid = np.zeros((GRID_SIZE, GRID_SIZE), dtype=bool)
 
 current_x = -0.375
-current_y = 0.375 if robot_id == "robot1" else 0.0
+current_y = 0.375 if "1" in robot_id else 0.0
 current_heading = 0.0
 last_encoder_values = {"fl": 0.0, "fr": 0.0}
 WHEEL_RADIUS = 0.0425
+
+# Grab this robot's specific assigned targets
+my_targets = TARGET_COORDINATES.get(robot_id, [])
 
 # =========================================================================
 # 4. LOGIC ENGINES 
@@ -316,9 +323,8 @@ while rosbot.step(timestep) != -1:
         current_state = RobotState.EXPLORING
 
     elif current_state == RobotState.EXPLORING:
-        # PRIORITIZE HARDCODED VICTIMS OVER RANDOM EXPLORATION
-        if TARGET_COORDINATES:
-            current_mission_target = TARGET_COORDINATES[0] 
+        if my_targets:
+            current_mission_target = my_targets[0] 
         else:
             if not search_waypoints:
                 search_waypoints = generate_coverage_waypoints(num_points=4)
@@ -337,13 +343,9 @@ while rosbot.step(timestep) != -1:
         if dist_to_wp < LOOKAHEAD_DISTANCE and len(current_path) > 0:
             current_target = current_path.pop(0)
         elif dist_to_wp < WAYPOINT_TOLERANCE and len(current_path) == 0:
-            # We reached the final destination!
             print(f"[{robot_id}] Reached destination: {current_mission_target}")
-            
-            # If this was one of our hardcoded targets, remove it from the list so we don't loop
-            if TARGET_COORDINATES and current_mission_target == TARGET_COORDINATES[0]:
-                TARGET_COORDINATES.pop(0)
-                
+            if my_targets and current_mission_target == my_targets[0]:
+                my_targets.pop(0)
             current_state = RobotState.EXPLORING
             continue
 
@@ -360,8 +362,19 @@ while rosbot.step(timestep) != -1:
             stuck_counter = 0
             continue
 
+        # Calculate standard pathfinding speeds
         pid_path = [current_target] + current_path
         left_speed, right_speed = steering_engine.calculate_speeds(current_x, current_y, current_heading, pid_path)
+
+        # 🚨 THE "TRAFFIC RULE" ANTI-COLLISION OVERRIDE 🚨
+        # If the other robot is directly in front of us (< 0.25m), swerve right immediately
+        depth_data = lidar.getRangeImage()
+        if depth_data:
+            center_dist = depth_data[len(depth_data) // 2]
+            if center_dist < 0.25:
+                # Override the PID and force a sharp right turn to avoid head-on crash
+                left_speed = 5.0
+                right_speed = -2.0
 
         motors["fl"].setVelocity(left_speed)
         motors["rl"].setVelocity(left_speed)
