@@ -6,10 +6,8 @@ import math
 import heapq
 import os
 import random
+import time
 from steering_pid import PIDSteeringController
-
-# Initialize steering engine
-steering_engine = PIDSteeringController(kp=3.0, max_speed=6.0)
 
 # =========================================================================
 # 1. INITIALIZATION & UNIVERSAL MAP LOADING
@@ -19,6 +17,20 @@ timestep = int(rosbot.getBasicTimeStep())
 robot_id = rosbot.getName()
 
 random.seed(robot_id)
+
+# Initialize steering engine
+steering_engine = PIDSteeringController(kp=3.0, max_speed=6.0)
+
+# --- System Constants for Efficiency ---
+WAYPOINT_TOLERANCE = 0.20  
+REROUTE_COOLDOWN = 3.0     
+STALL_VELOCITY_THRESHOLD = 0.005 
+
+class RobotState:
+    EXPLORING = "EXPLORING"
+    NAVIGATING = "NAVIGATING"
+    RECOVERING = "RECOVERING"
+    VERIFYING_VICTIM = "VERIFYING_VICTIM"
 
 # --- Motors ---
 motors = {
@@ -100,11 +112,10 @@ current_x = -0.375
 current_y = 0.375 if robot_id == "robot1" else 0.0
 current_heading = 0.0
 last_encoder_values = {"fl": 0.0, "fr": 0.0}
-
 WHEEL_RADIUS = 0.0425
 
 # =========================================================================
-# 4. LOGIC ENGINES (Universal Coordinate & Pathfinding)
+# 4. LOGIC ENGINES 
 # =========================================================================
 
 def update_odometry():
@@ -127,14 +138,13 @@ def update_odometry():
     current_x += dist_center * math.cos(current_heading)
     current_y += dist_center * math.sin(current_heading)
 
-def detect_victim():
+def detect_candidate():
     raw_img = camera.getImage()
     if not raw_img: 
         return False
     
     img_array = np.frombuffer(raw_img, np.uint8).reshape((camera.getHeight(), camera.getWidth(), 4))
-    frame_bgr = img_array[:, :, :3]
-    hsv_frame = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
+    hsv_frame = cv2.cvtColor(img_array[:, :, :3], cv2.COLOR_BGR2HSV)
     
     lower_color = np.array([5, 120, 120])
     upper_color = np.array([25, 255, 255])
@@ -144,9 +154,14 @@ def detect_victim():
     
     for contour in contours:
         if cv2.contourArea(contour) > 1200:
-            depth_data = lidar.getRangeImage()
-            if depth_data[len(depth_data) // 2] < 1.0:
-                return True
+            return True
+    return False
+
+def verify_depth():
+    depth_data = lidar.getRangeImage()
+    # Check center ray distance
+    if depth_data and depth_data[len(depth_data) // 2] < 1.0:
+        return True
     return False
 
 def world_to_grid(wx, wy):
@@ -163,7 +178,8 @@ def grid_to_world(gx, gy):
 
 def a_star_pathfind(start_world, target_world):
     small_map = cv2.resize(global_map, (GRID_SIZE, GRID_SIZE))
-    kernel = np.ones((3, 3), np.uint8)
+    # FIX: Reduced erosion kernel from 3x3 to 2x2 to prevent doorway blocking
+    kernel = np.ones((2, 2), np.uint8)
     inflated_map = cv2.erode(small_map, kernel)
     obstacle_grid = inflated_map < 127
     
@@ -201,9 +217,10 @@ def a_star_pathfind(start_world, target_world):
 
     return [target_world]
 
-def generate_safe_waypoints(map_array, num_points=4):
+def generate_safe_waypoints(map_array, num_points=6):
     small_map = cv2.resize(map_array, (GRID_SIZE, GRID_SIZE))
-    kernel = np.ones((5, 5), np.uint8) 
+    # FIX: Reduced generation erosion kernel from 5x5 to 3x3 to allow valid doorway points
+    kernel = np.ones((3, 3), np.uint8) 
     inflated_map = cv2.erode(small_map, kernel)
     safe_y, safe_x = np.where(inflated_map > 127)
     
@@ -217,70 +234,103 @@ def generate_safe_waypoints(map_array, num_points=4):
         waypoints = [(0.0, 0.0)]
     return waypoints
 
-# =========================================================================
-# 5. MAIN LOOP & STALL RECOVERY
-# =========================================================================
-print(f"[{robot_id}] Universal engine engaged.")
-search_waypoints = generate_safe_waypoints(global_map, num_points=6)
-current_target = search_waypoints.pop(0)
-current_path = a_star_pathfind((current_x, current_y), current_target)
+def stop_motors():
+    for motor in motors.values():
+        motor.setVelocity(0.0)
 
+# =========================================================================
+# 5. STATE MACHINE EXECUTION LOOP
+# =========================================================================
+print(f"[{robot_id}] High-Efficiency Engine Engaged.")
+search_waypoints = generate_safe_waypoints(global_map, num_points=8)
+current_target = None
+current_path = []
+
+current_state = RobotState.EXPLORING
 stuck_counter = 0
 last_x, last_y = current_x, current_y
+last_reroute_time = rosbot.getTime()
 
 while rosbot.step(timestep) != -1:
     update_odometry()
     
-    # --- STALL DETECTION & OBSTACLE ESCAPE BEHAVIOR ---
-    distance_moved = math.hypot(current_x - last_x, current_y - last_y)
-    if distance_moved < 0.005:
-        stuck_counter += 1
-    else:
-        stuck_counter = 0
-    
-    last_x, last_y = current_x, current_y
-    
-    if stuck_counter > 50: 
-        print(f"[{robot_id}] STUCK DETECTED: Backing away and rerouting...")
+    # ---------------------------------------------------------
+    # LAYER 1: UNINTERRUPTIBLE PERCEPTION (Always check for victims)
+    # ---------------------------------------------------------
+    if current_state != RobotState.VERIFYING_VICTIM and detect_candidate():
+        print(f"[{robot_id}] Visual candidate spotted. Verifying depth...")
+        current_state = RobotState.VERIFYING_VICTIM
+
+    # ---------------------------------------------------------
+    # LAYER 2: FINITE STATE MACHINE LOGIC
+    # ---------------------------------------------------------
+    if current_state == RobotState.VERIFYING_VICTIM:
+        stop_motors()
+        if verify_depth():
+            report_victim(current_x, current_y)
+            # Optional: Add a brief sleep/step here if you want it to pause for realism
+            rosbot.step(1000) 
+        # Resume exploration whether verified or false positive
+        current_state = RobotState.EXPLORING
+
+    elif current_state == RobotState.EXPLORING:
+        if not search_waypoints:
+            search_waypoints = generate_safe_waypoints(global_map, num_points=4)
+        
+        current_target = search_waypoints.pop(0)
+        current_path = a_star_pathfind((current_x, current_y), current_target)
+        
+        if current_path:
+            current_state = RobotState.NAVIGATING
+            last_reroute_time = rosbot.getTime()
+            print(f"[{robot_id}] Navigating to next target.")
+            
+    elif current_state == RobotState.NAVIGATING:
+        # Check waypoint arrival
+        if math.hypot(current_target[0] - current_x, current_target[1] - current_y) < WAYPOINT_TOLERANCE:
+            print(f"[{robot_id}] Waypoint reached.")
+            current_state = RobotState.EXPLORING
+            continue
+
+        # Check for stalls
+        distance_moved = math.hypot(current_x - last_x, current_y - last_y)
+        if distance_moved < STALL_VELOCITY_THRESHOLD:
+            stuck_counter += 1
+        else:
+            stuck_counter = 0
+
+        last_x, last_y = current_x, current_y
+
+        # Stall trigger with Cooldown Protection
+        if stuck_counter > 40 and (rosbot.getTime() - last_reroute_time > REROUTE_COOLDOWN):
+            current_state = RobotState.RECOVERING
+            stuck_counter = 0
+            continue
+
+        # Execute normal driving
+        left_speed, right_speed = steering_engine.calculate_speeds(
+            current_x, current_y, current_heading, current_path
+        )
+        motors["fl"].setVelocity(left_speed)
+        motors["rl"].setVelocity(left_speed)
+        motors["fr"].setVelocity(right_speed)
+        motors["rr"].setVelocity(right_speed)
+
+    elif current_state == RobotState.RECOVERING:
+        print(f"[{robot_id}] STALLED. Executing recovery maneuver.")
         
         # 1. Back up straight
-        for motor in motors.values(): 
-            motor.setVelocity(-3.0)
-        rosbot.step(400)
+        for motor in motors.values(): motor.setVelocity(-4.0)
+        rosbot.step(600)
         
-        # 2. Force a sharp spin to turn away from the obstacle/table
-        motors["fl"].setVelocity(-4.0)
-        motors["rl"].setVelocity(-4.0)
-        motors["fr"].setVelocity(4.0)
-        motors["rr"].setVelocity(4.0)
-        rosbot.step(500)
+        # 2. Spin aggressively away from the obstacle
+        motors["fl"].setVelocity(-5.0)
+        motors["rl"].setVelocity(-5.0)
+        motors["fr"].setVelocity(5.0)
+        motors["rr"].setVelocity(5.0)
+        rosbot.step(800)
         
-        # 3. Drop the problematic waypoint and reroute
-        if len(search_waypoints) > 0:
-            current_target = search_waypoints.pop(0)
-            current_path = a_star_pathfind((current_x, current_y), current_target)
-            
-        stuck_counter = 0
-        continue
-    # -------------------------------------------------
-    
-    if math.hypot(current_target[0] - current_x, current_target[1] - current_y) < 0.2:
-        if len(search_waypoints) > 0:
-            current_target = search_waypoints.pop(0)
-            current_path = a_star_pathfind((current_x, current_y), current_target)
-        else:
-            for motor in motors.values(): motor.setVelocity(0.0)
-            continue 
-    
-    if detect_victim():
-        for motor in motors.values(): motor.setVelocity(0.0)
-        report_victim(current_x, current_y)
-    
-    left_speed, right_speed = steering_engine.calculate_speeds(
-        current_x, current_y, current_heading, current_path
-    )
-    
-    motors["fl"].setVelocity(left_speed)
-    motors["rl"].setVelocity(left_speed)
-    motors["fr"].setVelocity(right_speed)
-    motors["rr"].setVelocity(right_speed)
+        stop_motors()
+        
+        # Immediately re-plan after clearing the trap
+        current_state = RobotState.EXPLORING
